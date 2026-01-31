@@ -10,7 +10,9 @@ const io = new Server(server, {
   cors: {
     origin: "*",
     methods: ["GET", "POST"]
-  }
+  },
+  pingInterval: 2000,
+  pingTimeout: 5000
 });
 
 app.use(cors());
@@ -19,8 +21,8 @@ app.use(express.json());
 const PORT = process.env.PORT || 3001;
 
 /* -------------------- DATA STORES -------------------- */
-const rooms = new Map(); // roomId -> { owner, users, messages, currentVideo, bannedUsers, mutedUsers }
-const users = new Map(); // socketId -> user
+const rooms = new Map();
+const users = new Map();
 const messageCooldown = new Map();
 
 /* -------------------- HELPERS -------------------- */
@@ -29,17 +31,15 @@ function createUser(socketId, username, role = 'viewer') {
     id: socketId,
     username: username?.slice(0, 20) || `User${Math.floor(Math.random() * 1000)}`,
     color: `hsl(${Math.random() * 360}, 70%, 60%)`,
-    role // 'owner' or 'viewer'
+    role
   };
 }
 
 function generateRoomId() {
-  // Generate a proper 6-character alphanumeric room ID
   return Math.random().toString(36).substring(2, 8).toUpperCase();
 }
 
 function isValidRoomId(roomId) {
-  // Room IDs must be 6 alphanumeric characters
   return /^[A-Z0-9]{6}$/.test(roomId);
 }
 
@@ -47,13 +47,17 @@ function getRoom(roomId) {
   if (!rooms.has(roomId)) {
     rooms.set(roomId, {
       owner: null,
-      users: new Map(), // socketId -> user object
+      users: new Map(),
       messages: [],
-      currentVideo: null,
-      currentTime: 0,
-      isPlaying: false,
-      bannedUsers: new Set(), // usernames
-      mutedUsers: new Set(), // socketIds
+      video: {
+        url: null,
+        currentTime: 0,
+        isPlaying: false,
+        playbackRate: 1,
+        volume: 1
+      },
+      bannedUsers: new Set(),
+      mutedUsers: new Set(),
       createdAt: Date.now()
     });
   }
@@ -133,9 +137,7 @@ io.on("connection", (socket) => {
     
     socket.emit("room-joined", {
       user,
-      currentVideo: room.currentVideo,
-      currentTime: room.currentTime,
-      isPlaying: room.isPlaying,
+      video: room.video,
       messages: room.messages.slice(-50),
       totalUsers: room.users.size,
       isOwner: false
@@ -174,35 +176,71 @@ io.on("connection", (socket) => {
     io.to(roomId).emit("new-message", msg);
   });
 
-  socket.on("change-video", ({ roomId, videoId }) => {
+  // Owner loads a new video
+  socket.on("load-video", ({ roomId, url }) => {
     if (!roomId || !rooms.has(roomId)) return;
     if (!isOwner(socket.id, roomId)) {
-      socket.emit("permission-error", { message: "Only the room owner can change videos" });
+      socket.emit("permission-error", { message: "Only the room owner can load videos" });
       return;
     }
 
     const room = rooms.get(roomId);
-    room.currentVideo = videoId;
-    room.currentTime = 0;
-    room.isPlaying = true;
+    room.video.url = url;
+    room.video.currentTime = 0;
+    room.video.isPlaying = true;
 
-    io.to(roomId).emit("video-changed", { videoId });
+    // Broadcast to ALL users including owner
+    io.to(roomId).emit("video-loaded", { 
+      url: url,
+      currentTime: 0,
+      isPlaying: true
+    });
   });
 
-  socket.on("sync-video", ({ roomId, currentTime, isPlaying }) => {
-    if (!roomId) return;
+  // Owner controls playback (play/pause/seek)
+  socket.on("video-control", ({ roomId, action, value }) => {
+    if (!roomId || !rooms.has(roomId)) return;
     if (!isOwner(socket.id, roomId)) return;
 
     const room = rooms.get(roomId);
-    if (room) {
-      room.currentTime = currentTime;
-      room.isPlaying = isPlaying;
+
+    switch (action) {
+      case 'play':
+        room.video.isPlaying = true;
+        break;
+      case 'pause':
+        room.video.isPlaying = false;
+        break;
+      case 'seek':
+        room.video.currentTime = value;
+        break;
+      case 'volume':
+        room.video.volume = value;
+        break;
+      case 'playbackRate':
+        room.video.playbackRate = value;
+        break;
     }
 
-    socket.to(roomId).emit("video-sync", {
-      currentTime,
-      isPlaying
+    // Broadcast to viewers only (not back to owner)
+    socket.to(roomId).emit("video-control", {
+      action,
+      value,
+      currentTime: room.video.currentTime,
+      isPlaying: room.video.isPlaying
     });
+  });
+
+  // Owner broadcasts current time periodically
+  socket.on("time-update", ({ roomId, currentTime }) => {
+    if (!roomId || !rooms.has(roomId)) return;
+    if (!isOwner(socket.id, roomId)) return;
+
+    const room = rooms.get(roomId);
+    room.video.currentTime = currentTime;
+
+    // Broadcast to viewers for sync check
+    socket.to(roomId).emit("time-sync", { currentTime });
   });
 
   socket.on("kick-user", ({ roomId, targetSocketId }) => {
@@ -269,7 +307,6 @@ io.on("connection", (socket) => {
       if (room.users.has(socket.id)) {
         room.users.delete(socket.id);
         
-        // If owner left, delete the room
         if (room.owner === socket.id) {
           io.to(roomId).emit("room-closed", { message: "Room owner has left. Room closed." });
           rooms.delete(roomId);
@@ -292,13 +329,12 @@ io.on("connection", (socket) => {
 setInterval(() => {
   const now = Date.now();
   rooms.forEach((room, roomId) => {
-    // Delete empty rooms older than 1 hour
     if (room.users.size === 0 && now - room.createdAt > 3600000) {
       rooms.delete(roomId);
       console.log(`🧹 Cleaned up room ${roomId}`);
     }
   });
-}, 300000); // Every 5 minutes
+}, 300000);
 
 /* -------------------- SERVER -------------------- */
 server.listen(PORT, () => {
