@@ -1,338 +1,338 @@
-const express = require("express");
-const http = require("http");
-const { Server } = require("socket.io");
-const cors = require("cors");
-const crypto = require("crypto");
+const express = require('express');
+const http = require('http');
+const { Server } = require('socket.io');
+const path = require('path');
 
 const app = express();
 const server = http.createServer(app);
-const io = new Server(server, {
-  cors: {
-    origin: "*",
-    methods: ["GET", "POST"]
-  },
-  pingInterval: 2000,
-  pingTimeout: 5000
+const io = new Server(server, { 
+    maxHttpBufferSize: 500 * 1024 * 1024,
+    cors: {
+        origin: "*",
+        methods: ["GET", "POST"]
+    }
 });
 
-app.use(cors());
-app.use(express.json());
+app.use(express.static(path.join(__dirname)));
 
-const PORT = process.env.PORT || 3001;
+// Enable CORS
+app.use((req, res, next) => {
+    res.header('Access-Control-Allow-Origin', '*');
+    res.header('Access-Control-Allow-Headers', '*');
+    next();
+});
 
-/* -------------------- DATA STORES -------------------- */
 const rooms = new Map();
-const users = new Map();
-const messageCooldown = new Map();
+const fileDownloads = new Map(); // Track downloads per file
+const fileFirstAccess = new Map(); // Track first access time
 
-/* -------------------- HELPERS -------------------- */
-function createUser(socketId, username, role = 'viewer') {
-  return {
-    id: socketId,
-    username: username?.slice(0, 20) || `User${Math.floor(Math.random() * 1000)}`,
-    color: `hsl(${Math.random() * 360}, 70%, 60%)`,
-    role
-  };
+let fetch, FormData;
+
+async function initDeps() {
+    const fetchModule = await import('node-fetch');
+    fetch = fetchModule.default;
+    FormData = (await import('form-data')).default;
 }
 
-function generateRoomId() {
-  return Math.random().toString(36).substring(2, 8).toUpperCase();
-}
+initDeps();
 
-function isValidRoomId(roomId) {
-  return /^[A-Z0-9]{6}$/.test(roomId);
-}
+const uploadProviders = {
+    async litterbox(buffer, filename, mimetype, expiry = '1h') {
+        const form = new FormData();
+        form.append('reqtype', 'fileupload');
+        form.append('time', expiry);
+        form.append('fileToUpload', buffer, { filename, contentType: mimetype });
 
-function getRoom(roomId) {
-  if (!rooms.has(roomId)) {
-    rooms.set(roomId, {
-      owner: null,
-      users: new Map(),
-      messages: [],
-      video: {
-        url: null,
-        currentTime: 0,
-        isPlaying: false,
-        volume: 1,
-        title: null,
-        thumbnail: null
-      },
-      bannedUsers: new Set(),
-      mutedUsers: new Set(),
-      createdAt: Date.now()
-    });
-  }
-  return rooms.get(roomId);
-}
+        const res = await fetch('https://litterbox.catbox.moe/resources/internals/api.php', {
+            method: 'POST',
+            body: form,
+            headers: form.getHeaders()
+        });
 
-function canSendMessage(socketId) {
-  const now = Date.now();
-  const last = messageCooldown.get(socketId) || 0;
-  if (now - last < 400) return false;
-  messageCooldown.set(socketId, now);
-  return true;
-}
-
-function isOwner(socketId, roomId) {
-  const room = rooms.get(roomId);
-  return room && room.owner === socketId;
-}
-
-function isBanned(username, roomId) {
-  const room = rooms.get(roomId);
-  return room && room.bannedUsers.has(username);
-}
-
-function isMuted(socketId, roomId) {
-  const room = rooms.get(roomId);
-  return room && room.mutedUsers.has(socketId);
-}
-
-/* -------------------- SOCKET LOGIC -------------------- */
-io.on("connection", (socket) => {
-  console.log("🟢 Connected:", socket.id);
-
-  socket.on("create-room", ({ username }) => {
-    const roomId = generateRoomId();
-    const user = createUser(socket.id, username, 'owner');
-    users.set(socket.id, user);
-    
-    const room = getRoom(roomId);
-    room.owner = socket.id;
-    room.users.set(socket.id, user);
-    
-    socket.join(roomId);
-    
-    socket.emit("room-created", {
-      roomId,
-      user,
-      totalUsers: room.users.size
-    });
-    
-    console.log(`🎬 Room ${roomId} created by ${username}`);
-  });
-
-  socket.on("join-room", ({ roomId, username }) => {
-    if (!roomId || !isValidRoomId(roomId)) {
-      socket.emit("join-error", { message: "Invalid room ID format" });
-      return;
-    }
-
-    if (!rooms.has(roomId)) {
-      socket.emit("join-error", { message: "Room does not exist" });
-      return;
-    }
-
-    if (isBanned(username, roomId)) {
-      socket.emit("join-error", { message: "You have been banned from this room" });
-      return;
-    }
-
-    const user = createUser(socket.id, username, 'viewer');
-    users.set(socket.id, user);
-    
-    const room = getRoom(roomId);
-    room.users.set(socket.id, user);
-    
-    socket.join(roomId);
-    
-    socket.emit("room-joined", {
-      user,
-      video: room.video,
-      messages: room.messages.slice(-50),
-      totalUsers: room.users.size,
-      isOwner: false
-    });
-    
-    socket.to(roomId).emit("user-joined", {
-      user,
-      totalUsers: room.users.size
-    });
-  });
-
-  socket.on("send-message", ({ roomId, message }) => {
-    if (!roomId || !message) return;
-    if (!canSendMessage(socket.id)) return;
-    if (isMuted(socket.id, roomId)) {
-      socket.emit("message-error", { message: "You are muted" });
-      return;
-    }
-
-    const user = users.get(socket.id);
-    if (!user || !rooms.has(roomId)) return;
-
-    const msg = {
-      id: crypto.randomUUID(),
-      user,
-      message: message.slice(0, 500),
-      timestamp: Date.now()
-    };
-
-    const room = rooms.get(roomId);
-    room.messages.push(msg);
-    if (room.messages.length > 100) {
-      room.messages.shift();
-    }
-
-    io.to(roomId).emit("new-message", msg);
-  });
-
-  socket.on("load-video", ({ roomId, url, title, thumbnail }) => {
-    if (!roomId || !rooms.has(roomId)) return;
-    if (!isOwner(socket.id, roomId)) {
-      socket.emit("permission-error", { message: "Only the room owner can load videos" });
-      return;
-    }
-
-    const room = rooms.get(roomId);
-    room.video.url = url;
-    room.video.currentTime = 0;
-    room.video.isPlaying = true;
-    room.video.title = title || null;
-    room.video.thumbnail = thumbnail || null;
-
-    io.to(roomId).emit("video-loaded", { 
-      url: url,
-      currentTime: 0,
-      isPlaying: true,
-      title: title,
-      thumbnail: thumbnail
-    });
-  });
-
-  socket.on("video-control", ({ roomId, action, value }) => {
-    if (!roomId || !rooms.has(roomId)) return;
-    if (!isOwner(socket.id, roomId)) return;
-
-    const room = rooms.get(roomId);
-
-    switch (action) {
-      case 'play':
-        room.video.isPlaying = true;
-        break;
-      case 'pause':
-        room.video.isPlaying = false;
-        break;
-      case 'seek':
-        room.video.currentTime = value;
-        break;
-      case 'volume':
-        room.video.volume = value;
-        break;
-    }
-
-    socket.to(roomId).emit("video-control", {
-      action,
-      value,
-      currentTime: room.video.currentTime,
-      isPlaying: room.video.isPlaying
-    });
-  });
-
-  socket.on("time-update", ({ roomId, currentTime }) => {
-    if (!roomId || !rooms.has(roomId)) return;
-    if (!isOwner(socket.id, roomId)) return;
-
-    const room = rooms.get(roomId);
-    room.video.currentTime = currentTime;
-
-    socket.to(roomId).emit("time-sync", { currentTime });
-  });
-
-  socket.on("kick-user", ({ roomId, targetSocketId }) => {
-    if (!isOwner(socket.id, roomId)) return;
-    
-    const room = rooms.get(roomId);
-    const targetUser = room?.users.get(targetSocketId);
-    
-    if (targetUser) {
-      io.to(targetSocketId).emit("kicked", { message: "You have been kicked from the room" });
-      io.to(targetSocketId).disconnectSockets();
-    }
-  });
-
-  socket.on("ban-user", ({ roomId, targetSocketId }) => {
-    if (!isOwner(socket.id, roomId)) return;
-    
-    const room = rooms.get(roomId);
-    const targetUser = room?.users.get(targetSocketId);
-    
-    if (targetUser) {
-      room.bannedUsers.add(targetUser.username);
-      io.to(targetSocketId).emit("banned", { message: "You have been banned from this room" });
-      io.to(targetSocketId).disconnectSockets();
-    }
-  });
-
-  socket.on("mute-user", ({ roomId, targetSocketId }) => {
-    if (!isOwner(socket.id, roomId)) return;
-    
-    const room = rooms.get(roomId);
-    if (room) {
-      room.mutedUsers.add(targetSocketId);
-      io.to(targetSocketId).emit("muted", { message: "You have been muted" });
-    }
-  });
-
-  socket.on("unmute-user", ({ roomId, targetSocketId }) => {
-    if (!isOwner(socket.id, roomId)) return;
-    
-    const room = rooms.get(roomId);
-    if (room) {
-      room.mutedUsers.delete(targetSocketId);
-      io.to(targetSocketId).emit("unmuted", { message: "You have been unmuted" });
-    }
-  });
-
-  socket.on("get-users", ({ roomId }) => {
-    const room = rooms.get(roomId);
-    if (room) {
-      const userList = Array.from(room.users.values()).map(u => ({
-        ...u,
-        isMuted: room.mutedUsers.has(u.id)
-      }));
-      socket.emit("users-list", { users: userList });
-    }
-  });
-
-  socket.on("disconnect", () => {
-    const user = users.get(socket.id);
-    if (!user) return;
-
-    rooms.forEach((room, roomId) => {
-      if (room.users.has(socket.id)) {
-        room.users.delete(socket.id);
+        if (!res.ok) throw new Error('Litterbox upload failed');
+        const url = (await res.text()).trim();
         
-        if (room.owner === socket.id) {
-          io.to(roomId).emit("room-closed", { message: "Room owner has left. Room closed." });
-          rooms.delete(roomId);
-        } else {
-          socket.to(roomId).emit("user-left", {
-            user,
-            totalUsers: room.users.size
-          });
+        const hours = { '1h': 1, '12h': 12, '24h': 24, '72h': 72 };
+        const expiresAt = new Date(Date.now() + (hours[expiry] || 1) * 60 * 60 * 1000);
+
+        return { url, expiresAt };
+    },
+
+    async catbox(buffer, filename, mimetype) {
+        const form = new FormData();
+        form.append('reqtype', 'fileupload');
+        form.append('fileToUpload', buffer, { filename, contentType: mimetype });
+
+        const res = await fetch('https://catbox.moe/user/api.php', {
+            method: 'POST',
+            body: form,
+            headers: form.getHeaders()
+        });
+
+        if (!res.ok) throw new Error('Catbox upload failed');
+        const url = (await res.text()).trim();
+        
+        return { url, expiresAt: null };
+    },
+
+    async gofile(buffer, filename, mimetype) {
+        const serverRes = await fetch('https://api.gofile.io/servers');
+        const serverData = await serverRes.json();
+        if (serverData.status !== 'ok') throw new Error('Gofile server error');
+        
+        const serverName = serverData.data.servers[0].name;
+
+        const form = new FormData();
+        form.append('file', buffer, { filename, contentType: mimetype });
+
+        const res = await fetch(`https://${serverName}.gofile.io/contents/uploadfile`, {
+            method: 'POST',
+            body: form,
+            headers: form.getHeaders()
+        });
+
+        const data = await res.json();
+        if (data.status !== 'ok') throw new Error('Gofile upload failed');
+        
+        const expiresAt = new Date(Date.now() + 10 * 24 * 60 * 60 * 1000);
+        return { url: data.data.downloadPage, expiresAt };
+    },
+
+    async tmpfiles(buffer, filename, mimetype) {
+        const form = new FormData();
+        form.append('file', buffer, { filename, contentType: mimetype });
+
+        const res = await fetch('https://tmpfiles.org/api/v1/upload', {
+            method: 'POST',
+            body: form,
+            headers: form.getHeaders()
+        });
+
+        const data = await res.json();
+        if (data.status !== 'success') throw new Error('tmpfiles upload failed');
+        
+        const url = data.data.url.replace('tmpfiles.org/', 'tmpfiles.org/dl/');
+        const expiresAt = new Date(Date.now() + 60 * 60 * 1000);
+        
+        return { url, expiresAt };
+    }
+};
+
+function generateCode() {
+    const chars = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
+    let code = '';
+    for (let i = 0; i < 6; i++) code += chars[Math.floor(Math.random() * chars.length)];
+    return code;
+}
+
+function generateId() {
+    return Date.now().toString(36) + Math.random().toString(36).substr(2);
+}
+
+function base64ToBuffer(base64) {
+    const matches = base64.match(/^data:(.+);base64,(.+)$/);
+    if (!matches) throw new Error('Invalid base64');
+    return { buffer: Buffer.from(matches[2], 'base64'), mimetype: matches[1] };
+}
+
+function burnFile(fileId, roomCode) {
+    const room = rooms.get(roomCode);
+    if (!room) return;
+    
+    room.files = room.files.filter(f => f.id !== fileId);
+    fileDownloads.delete(fileId);
+    fileFirstAccess.delete(fileId);
+    
+    io.to(roomCode).emit('file-burned', { fileId });
+    console.log(`🔥 File ${fileId} burned`);
+}
+
+function checkBurnConditions(fileId, roomCode) {
+    const room = rooms.get(roomCode);
+    if (!room) return;
+    
+    const file = room.files.find(f => f.id === fileId);
+    if (!file || !file.burn) return;
+
+    if (file.burn.type === 'downloads') {
+        const downloads = fileDownloads.get(fileId) || 0;
+        if (downloads >= file.burn.downloads) {
+            burnFile(fileId, roomCode);
         }
-      }
+    } else if (file.burn.type === 'time') {
+        const firstAccess = fileFirstAccess.get(fileId);
+        if (firstAccess) {
+            const burnTime = firstAccess + (file.burn.minutes * 60 * 1000);
+            if (Date.now() >= burnTime) {
+                burnFile(fileId, roomCode);
+            }
+        }
+    }
+}
+
+io.on('connection', (socket) => {
+    let currentRoom = null;
+    let currentUser = null;
+
+    socket.on('create-room', ({ username }) => {
+        const roomCode = generateCode();
+        rooms.set(roomCode, { users: new Map([[socket.id, username]]), files: [] });
+        socket.join(roomCode);
+        currentRoom = roomCode;
+        currentUser = username;
+        socket.emit('room-created', { roomCode });
+        console.log(`✨ Room ${roomCode} created by ${username}`);
     });
 
-    users.delete(socket.id);
-    messageCooldown.delete(socket.id);
-    console.log("🔴 Disconnected:", socket.id);
-  });
+    socket.on('join-room', ({ username, roomCode }) => {
+        const room = rooms.get(roomCode);
+        if (!room) return socket.emit('error', 'Room not found');
+
+        room.users.set(socket.id, username);
+        socket.join(roomCode);
+        currentRoom = roomCode;
+        currentUser = username;
+
+        socket.emit('room-joined', { roomCode, files: room.files });
+        socket.to(roomCode).emit('user-joined', { username, userCount: room.users.size });
+        io.to(roomCode).emit('users-update', room.users.size);
+        console.log(`👋 ${username} joined ${roomCode}`);
+    });
+
+    socket.on('upload-file', async ({ tempId, name, size, type, data, provider, expiry, burn, encrypted, encryptionKey }) => {
+        if (!currentRoom) return;
+
+        try {
+            socket.emit('upload-progress', { tempId, progress: 10 });
+
+            const { buffer, mimetype } = base64ToBuffer(data);
+            socket.emit('upload-progress', { tempId, progress: 30 });
+
+            const uploadFn = uploadProviders[provider];
+            if (!uploadFn) throw new Error('Invalid provider');
+
+            const result = await uploadFn(buffer, name, mimetype || type, expiry);
+            socket.emit('upload-progress', { tempId, progress: 90 });
+
+            const file = {
+                id: generateId(),
+                tempId,
+                name,
+                size,
+                type,
+                provider,
+                url: result.url,
+                expiresAt: result.expiresAt?.toISOString() || null,
+                sharedBy: currentUser,
+                timestamp: Date.now(),
+                burn: burn || null,
+                encrypted: encrypted || false,
+                encryptionKey: encryptionKey || null
+            };
+
+            const room = rooms.get(currentRoom);
+            if (room) {
+                room.files.push(file);
+                if (room.files.length > 100) room.files.shift();
+            }
+
+            // Initialize download counter
+            if (burn) {
+                fileDownloads.set(file.id, 0);
+            }
+
+            io.to(currentRoom).emit('file-shared', file);
+            console.log(`📁 ${name} uploaded via ${provider}${burn ? ' [BURN]' : ''}${encrypted ? ' [ENCRYPTED]' : ''}`);
+
+        } catch (err) {
+            console.error('❌ Upload error:', err.message);
+            socket.emit('upload-error', { tempId, error: err.message });
+        }
+    });
+
+    socket.on('file-downloaded', ({ fileId }) => {
+        if (!currentRoom) return;
+        
+        const room = rooms.get(currentRoom);
+        if (!room) return;
+        
+        const file = room.files.find(f => f.id === fileId);
+        if (!file || !file.burn) return;
+
+        // Track download
+        const downloads = (fileDownloads.get(fileId) || 0) + 1;
+        fileDownloads.set(fileId, downloads);
+
+        // Track first access for time-based burn
+        if (!fileFirstAccess.has(fileId)) {
+            fileFirstAccess.set(fileId, Date.now());
+            
+            // Set timer for time-based burn
+            if (file.burn.type === 'time') {
+                setTimeout(() => {
+                    checkBurnConditions(fileId, currentRoom);
+                }, file.burn.minutes * 60 * 1000);
+            }
+        }
+
+        // Check if should burn
+        checkBurnConditions(fileId, currentRoom);
+    });
+
+    socket.on('leave-room', () => handleLeave());
+    socket.on('disconnect', () => handleLeave());
+
+    function handleLeave() {
+        if (currentRoom && currentUser) {
+            const room = rooms.get(currentRoom);
+            if (room) {
+                room.users.delete(socket.id);
+                socket.to(currentRoom).emit('user-left', { username: currentUser, userCount: room.users.size });
+                io.to(currentRoom).emit('users-update', room.users.size);
+                if (room.users.size === 0) {
+                    // Clean up file tracking for this room
+                    room.files.forEach(f => {
+                        fileDownloads.delete(f.id);
+                        fileFirstAccess.delete(f.id);
+                    });
+                    rooms.delete(currentRoom);
+                }
+            }
+            console.log(`👋 ${currentUser} left ${currentRoom}`);
+        }
+        currentRoom = null;
+        currentUser = null;
+    }
 });
 
-/* -------------------- CLEANUP -------------------- */
+// Cleanup
 setInterval(() => {
-  const now = Date.now();
-  rooms.forEach((room, roomId) => {
-    if (room.users.size === 0 && now - room.createdAt > 3600000) {
-      rooms.delete(roomId);
-      console.log(`🧹 Cleaned up room ${roomId}`);
+    const now = Date.now();
+    for (const [code, room] of rooms) {
+        room.files = room.files.filter(f => {
+            if (f.expiresAt && new Date(f.expiresAt).getTime() <= now) {
+                fileDownloads.delete(f.id);
+                fileFirstAccess.delete(f.id);
+                return false;
+            }
+            return true;
+        });
     }
-  });
-}, 300000);
+}, 60 * 1000);
 
-/* -------------------- SERVER -------------------- */
+const PORT = process.env.PORT || 3000;
 server.listen(PORT, () => {
-  console.log(`🔥 Sovereign backend running on port ${PORT}`);
+    console.log(`
+    ╦  ╔═╗╔═╗╔╦╗
+    ║  ║ ║║ ║║║║
+    ╩═╝╚═╝╚═╝╩ ╩  v2.0
+    
+    🌐 http://localhost:${PORT}
+    
+    Features:
+    🔥 Burn After Read
+    🔐 Zero-Knowledge Encryption
+    📊 Download Tracking
+    ⏱️ Time-Based Destruction
+    `);
 });
