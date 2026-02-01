@@ -53,8 +53,9 @@ function getRoom(roomId) {
         url: null,
         currentTime: 0,
         isPlaying: false,
-        playbackRate: 1,
-        volume: 1
+        volume: 1,
+        title: null,
+        thumbnail: null
       },
       bannedUsers: new Set(),
       mutedUsers: new Set(),
@@ -177,7 +178,7 @@ io.on("connection", (socket) => {
   });
 
   // Owner loads a new video
-  socket.on("load-video", ({ roomId, url }) => {
+  socket.on("load-video", ({ roomId, url, title, thumbnail }) => {
     if (!roomId || !rooms.has(roomId)) return;
     if (!isOwner(socket.id, roomId)) {
       socket.emit("permission-error", { message: "Only the room owner can load videos" });
@@ -188,12 +189,16 @@ io.on("connection", (socket) => {
     room.video.url = url;
     room.video.currentTime = 0;
     room.video.isPlaying = true;
+    room.video.title = title || null;
+    room.video.thumbnail = thumbnail || null;
 
     // Broadcast to ALL users including owner
     io.to(roomId).emit("video-loaded", { 
       url: url,
       currentTime: 0,
-      isPlaying: true
+      isPlaying: true,
+      title: title,
+      thumbnail: thumbnail
     });
   });
 
@@ -216,9 +221,6 @@ io.on("connection", (socket) => {
         break;
       case 'volume':
         room.video.volume = value;
-        break;
-      case 'playbackRate':
-        room.video.playbackRate = value;
         break;
     }
 
