@@ -177,7 +177,6 @@ io.on("connection", (socket) => {
     io.to(roomId).emit("new-message", msg);
   });
 
-  // Owner loads a new video
   socket.on("load-video", ({ roomId, url, title, thumbnail }) => {
     if (!roomId || !rooms.has(roomId)) return;
     if (!isOwner(socket.id, roomId)) {
@@ -192,7 +191,6 @@ io.on("connection", (socket) => {
     room.video.title = title || null;
     room.video.thumbnail = thumbnail || null;
 
-    // Broadcast to ALL users including owner
     io.to(roomId).emit("video-loaded", { 
       url: url,
       currentTime: 0,
@@ -202,7 +200,6 @@ io.on("connection", (socket) => {
     });
   });
 
-  // Owner controls playback (play/pause/seek)
   socket.on("video-control", ({ roomId, action, value }) => {
     if (!roomId || !rooms.has(roomId)) return;
     if (!isOwner(socket.id, roomId)) return;
@@ -224,7 +221,6 @@ io.on("connection", (socket) => {
         break;
     }
 
-    // Broadcast to viewers only (not back to owner)
     socket.to(roomId).emit("video-control", {
       action,
       value,
@@ -233,7 +229,6 @@ io.on("connection", (socket) => {
     });
   });
 
-  // Owner broadcasts current time periodically
   socket.on("time-update", ({ roomId, currentTime }) => {
     if (!roomId || !rooms.has(roomId)) return;
     if (!isOwner(socket.id, roomId)) return;
@@ -241,7 +236,6 @@ io.on("connection", (socket) => {
     const room = rooms.get(roomId);
     room.video.currentTime = currentTime;
 
-    // Broadcast to viewers for sync check
     socket.to(roomId).emit("time-sync", { currentTime });
   });
 
